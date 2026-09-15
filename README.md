@@ -1,47 +1,96 @@
 # 高岛易断 · Cardputer ADV 查询器
 
 把《高岛易断》（高岛吞象 / Takashima Ekidan，明治时代公版文本）全文装进 Cardputer ADV，
-开机即可按编号查任意一卦的详细占断解读，中文在 1.14" 屏上实时渲染、可滚动。
+开机按编号查任意一卦，逐层下钻到「全卦总论」或某一爻的详细占断解读，中文在 1.14" 屏上实时渲染、可滚动。
+
+## 三层浏览结构
+```
+① 选卦   64 卦编号 + 卦名列表（右侧画该卦六爻图形）
+   │  Enter
+   ▼
+② 详目   标题行只显示本卦卦名（与右上角电量框同一行齐平）
+   │      本卦 7 个条目，右侧卦象高亮当前那一爻
+   │      条目名一行放不下时：仅"当前选中"那条缓慢平滑滚动，其余截断显示
+   │      1 全卦总论      ← 卦名释义 / 卦辞 / 彖传 / 大象 / 总占
+   │      2 初九 潜龙勿用
+   │      3 九二 见龙在田，利见…   ← 未选中：截断 + 省略号
+   │      ...
+   │      7 上九 亢龙有悔
+   │  Enter
+   ▼
+③ 正文   所选条目的完整解读（爻题 → 象传 → 高岛释义 → 占 → 占例），可滚动
+```
+层级命名：第②层叫「**详目**」——取「本卦详目」之意，即一卦之下的细目；
+七个条目沿用易学原生的「全卦 + 六爻」叫法，爻名（初九/六二/上六…）本身就是最准确的目录名。
+
+## 操作（键盘方向箭头是 `;` `,` `.` `/` 四键的第二功能）
+| 层级 | 上下键 `;` `.` | 左右键 `,` `/` | Enter | m |
+|---|---|---|---|---|
+| ① 选卦 | 移动一行 | 翻一整页 | 打开所选卦 | — |
+| ② 详目 | 切换条目 | **上一卦 / 下一卦** | 进入正文 | 回选卦 |
+| ③ 正文 | 滚动一行 | 翻一整页 | — | 回详目 |
+
+另：选卦态可直接数字键输入编号（1–64）再 Enter；`n`/`p` 等价于 下/上 一行。
 
 ## 数据来源（最全公开版）
-- 站点：`gaodaoyiduan.org/original/` 的 64 个卦页（每卦含卦辞、《彖传》《大象》、六爻逐爻的
-  「高岛占断」与「占例」）。
-- 抓取：64 页 HTML 已存于 `raw/`，由 `src/gddy_data.h` 脚本化提取（卦名 + 全文，UTF-8）。
-- 体量：64 卦正文合计约 **1.12 MB**（平均每卦 18KB），为目前能拿到的较完整版本。
+- 站点：`gaodaoyiduan.org/original/` 的 64 个卦页（每卦含卦名释义、卦辞、《彖传》《大象》、
+  六爻逐爻的「高岛占断」与「占例」，并含乾/坤的「用九/用六」）。
+- 抓取：64 页 HTML 存于 `raw/`；`_build.py` 把每卦正文按 `h3`（爻题）切成 **7 段**，
+  生成 `src/gddy_data.h`（**1.55 MB，448 段**）。
+- 正文元素语义（解析要点，**别漏**）：
+  | 标签 | 含义 |
+  |---|---|
+  | `h2` | 卦名 |
+  | `h3` | **爻题**（`初九: 潜龙勿用。`）—— 分段的锚点 |
+  | `h4` | 小节标题（`占` / `占例`）→ 文中渲染成 `【占】` |
+  | `p` | 正文段落 |
+  | `blockquote.border-l-4` | 引文（卦辞 / 《彖传》/《大象》/《象传》） |
+  | `ul > li` | **「占」下的问答条目**（`问战征：…`） |
+  > 首版解析只抓了 `h2|h3|h4|p|b`，结果 `<blockquote>` 没匹配上（`<b\b` 不匹配 `<blockquote>`）、
+  > `<li>` 完全没抓 —— 表现为**「占」下面的内容整段消失**。现已补齐这两类。
+- 清洗：剔除站点排版残留（字间孤立空格、`［82］` 式校勘编号）。
 
 ## 中文显示（关键技巧）
 - **M5GFX 库自带简体中文 efont 点阵字库**（`lgfx::fonts::efontCN_12/14/16/24`），
-  直接 `setFont(&lgfx::fonts::efontCN_12)` 即可显示中文，**无需自己生成/外接字库**。
+  直接 `setFont(&lgfx::fonts::efontCN_14)` 即可显示中文，**无需自己生成/外接字库**。
 - 文本以 `const char*`（UTF-8）烧进 Flash，运行时按字数折行、分页滚动。
+- 详目页行高在 `setup()` 里按 `fontHeight()` **实测**取值（并夹紧到 7 行刚好放得下），
+  不写死，避免换字号后 7 行溢出屏幕。
+- 详目条目名一行放不下时，**只有当前选中那条会滚**，其余条目静止截断成「前几字 + 省略号」。
+- 滚动是**逐像素平滑滑动**（不是逐字跳跃）：把整名先画进一个 240×行高 的离屏缓冲
+  （`LGFX_Sprite`），再按像素偏移从中切一条 `pushImage` 推上屏；节奏为
+  **停 1.2s → 平滑滚到尾 → 停 0.9s → 平滑滚回 → 循环**，约 45px/s。
+  位移时只重绘这一行，不整屏刷、不闪。缓冲分配失败会自动退化成静态截断显示。
 
 ## 工程文件
-- `platformio.ini` —— 用本地 M5Stack 平台（`D:/cardputer/platform-m5stack`）+ `m5stack_cardputer` 板型；
-  因数据+字库较大，已用 `partitions.csv`（`max_app_8MB`，app 分区 ~7.9MB）突破默认 1.25MB 上限。
-- `src/main.cpp` —— 主程序：开机显示 64 卦编号+卦名（可滚动），输入编号看详解。
-- `src/gddy_data.h` —— 自动生成的 64 卦数据（编号 / 卦名 / 全文）。
-- `partitions.csv` —— 8MB Flash 最大 app 分区表。
-- `raw/` —— 64 卦原始 HTML（留档，可重跑解析脚本更新数据）。
-
-## 操作
-- 列表态：数字键输入编号（1–64）→ `Enter` 打开； `n` 下翻 / `p` 上翻；直接 `Enter` 打开当前选中。
-- 详情态： `n` 下滚 / `p` 上滚； `m` 返回列表。
+| 文件 | 说明 |
+|---|---|
+| `platformio.ini` | 本地 M5Stack 平台（`D:/cardputer/platform-m5stack`）+ `m5stack_cardputer` 板型 |
+| `partitions.csv` | 8MB Flash 最大 app 分区（`max_app_8MB`，~7.9MB），突破默认 1.25MB 上限 |
+| `src/main.cpp` | 主程序：三层视图（选卦 / 详目 / 正文）、卦象绘制、电量显示 |
+| `src/gddy_data.h` | 自动生成的 64 卦 × 7 段数据 |
+| `_build.py` | **数据重建脚本**：`raw/*.html` → `src/gddy_data.h` |
+| `_verify.py` | **数据校验脚本**：段数 / 标签 / 目录名宽度 / 正文非空 |
+| `raw/` | 64 卦原始 HTML（留档） |
 
 ## 构建与烧录
 ```bat
-pio run -d D:/cardputer/gddy            # 编译
-pio run -d D:/cardputer/gddy -t upload  # 烧录（插线；必要时按住侧面 G0/BOOT 进下载模式）
-pio device monitor -b 115200            # 看串口
+python D:/cardputer/gddy/_build.py        # 需要时重建数据
+python D:/cardputer/gddy/_verify.py       # 校验数据(输出 _verify.out)
+pio run -d D:/cardputer/gddy              # 编译  (Flash ~30%)
+pio run -d D:/cardputer/gddy -t upload    # 烧录（插线；必要时按住侧面 G0/BOOT 进下载模式）
+pio device monitor -b 115200              # 看串口
 ```
 > 若日后 `pio platform update` 把框架升级、编译报 `pins_arduino.h` 缺失，跑一次
 > `python D:/cardputer/fix_variant.py` 重注入 Cardputer 板型头文件。
 
 ## 在 velxio.dev 预览
-velxio 的 Cardputer ADV 用同款 `M5Cardputer` 库，本工程 `src/main.cpp` 可直接粘进
-`velxio.dev/editor/`（选 M5 Cardputer ADV）运行；`gddy_data.h` 也一并粘入 `src/` 即可。
+velxio 的 Cardputer ADV 用同款 `M5Cardputer` 库，`src/main.cpp` 可直接粘进
+`velxio.dev/editor/`（选 M5 Cardputer ADV）运行；`src/gddy_data.h` 也一并粘入 `src/` 即可。
 注意 velxio 是否内置 efont 中文字库取决于其环境，若缺中文可改回 ASCII 提示或在该平台另行加载字库。
 
 ## 备注
 - 全本《高岛易断》体量很大（原书数百页），这里收录的是「每卦完整占断」级文本；若想进一步
-  精简体积，可在解析脚本里只保留卦辞+六爻断语、去掉占例。
-- 想更新/扩充数据：改 `raw/` 下 HTML 或替换来源，重跑 `gddy_data.h` 生成逻辑（见本仓库
-  `D:/cardputer/gddy/` 的生成脚本思路）即可。
+  精简体积，可在 `_build.py` 里只保留卦辞 + 六爻断语、去掉「占例」。
+- 想更新/扩充数据：替换 `raw/` 下 HTML 后重跑 `_build.py` 即可（结构变了就同步改 `_verify.py` 的断言）。
+- 乾/坤两卦的「用九 / 用六」并入「上九 / 上六」段落尾部，不单独占条目（保持恒为 7 项）。
