@@ -1,7 +1,7 @@
 /*
  * 高岛易断 · Cardputer 查询器
  * ------------------------------------------------
- * 开机进「主菜单」，两件事：
+ * 开机进「主菜单」，三件事：
  *
  *   一、数字起卦占卜 —— 傅佩荣《易经入门 17 讲》的随机数(数字)起卦法，数字由用户自己报
  *       输入 9 位数字 = 三组三位数：
@@ -11,7 +11,17 @@
  *       动爻阴阳互换即得「之卦」。起卦后 Enter 直接进本卦详目，光标停在动爻那一条上，
  *       b 可切去看之卦 —— 断卦就是「本卦 + 动爻爻辞 + 之卦」这三件套。
  *
- *   二、高岛易断原文 —— 三层浏览：
+ *   二、时间起卦 —— 梅花易数「年月日时起例」，用起卦那一刻的时间定卦。
+ *       Cardputer ADV(Stamp-S3A) 没有 RTC 芯片, 断电后系统时间必丢, 也谈不上自动对时,
+ *       所以时间由用户当场输入: 年(4位) 月(2位) 日(2位) 时(2位), 共 10 位数字。
+ *         上卦(外卦) = (年支数 + 农历月 + 农历日)        ÷ 8 取余, 除尽记 8
+ *         下卦(内卦) = (年支数 + 农历月 + 农历日 + 时数) ÷ 8 取余, 除尽记 8
+ *         动爻       = (年支数 + 农历月 + 农历日 + 时数) ÷ 6 取余, 除尽记 6
+ *       年支数 = 子1 丑2 寅3 … 亥12;  时数 = 时辰序数(子1 … 亥12)。
+ *       关键: 月、日都取**农历**月日 —— 用户输的是公历(方便对表), 进程序先
+ *       solarToLunar() 换算成农历再代入公式(详见 calcCastByTime() 上方说明)。
+ *
+ *   三、高岛易断原文 —— 三层浏览：
  *       ① 选卦  64 卦编号+卦名列表，右侧显示该卦六爻图形
  *       ② 详目  选定一卦后列出 7 个条目 ——「全卦总论」+ 初/二/三/四/五/上六爻
  *       ③ 正文  所选条目的详细解读，可滚动
@@ -24,7 +34,11 @@
  *            9 位里任何一位都可以是 0（含 004 这类，已放开"每组首位非 0"的严格设定）
  *            输入过程中不显示任何换算结果(卦名/余数/爻位)，只报进度 ——
  *            以免报数者边输边看到卦象、影响判断；换算结果统一在起卦结果页揭晓。
- *   起卦态： Enter=看本卦(停在动爻)   b=看之卦   r=回去改数字   m=回主菜单
+ *   时间输入：0-9=输入(共 10 位: 年4 月2 日2 时2)  del=退格  Enter=起卦  m=回主菜单
+ *            输入过程只回显"输了什么"和换算出的「农历日期 / 时辰」读法, 同样不透卦象;
+ *            年月日时会做合法性校验(公历大小月 + 农历表覆盖范围), 不合法会在提示行标出;
+ *            若输入 23 时, 提示行会提醒"传统作次日子时"(本实现不替你改日期, 由你决定)。
+ *   起卦态： Enter=看本卦(停在动爻)   b=看之卦   r=回去改数字/改时间   m=回主菜单
  *   选卦态： 数字键输编号 -> Enter 打开；  Enter 打开当前选中
  *            上下键=移动一行   左右键=翻一整页   m=回主菜单
  *   详目态： 标题行只显示卦名(与右上电量框同一行)，下列 7 个条目，
@@ -48,6 +62,7 @@
 #include <cstdio>
 #include "gddy_data.h"
 #include "sup_font.h"          // 补字字体(efont 缺的生僻字), 由 _mkfont.py 生成
+#include "lunar.h"             // 公历->农历(表由 _lunar_table.py 生成)
 
 // ---------- UI 常量 ----------
 static const int ROW_H         = 16;    // 正文行高
@@ -72,7 +87,7 @@ static const uint32_t C_HEX_HL = 0xF800;   // 卦象中"当前爻"高亮色
 static const uint32_t C_GRID   = 0x31A6;   // 分栏线
 
 // ---------- 状态 ----------
-enum View { SPLASH, MODE, LIST, TOC, DETAIL, CAST, INPUT9 };
+enum View { SPLASH, MODE, LIST, TOC, DETAIL, CAST, INPUT9, INPUTT };
 static View     view     = SPLASH;
 static int      sel      = 0;     // 选卦: 当前选中卦 0..63
 static int      listTop  = 0;     // 选卦: 首行索引
@@ -86,9 +101,9 @@ static bool      dirty    = true;
 static int       g_tocRowH = 16;  // 详目行高(按字体实际高度算)
 static int       g_tocY0   = 18;  // 详目首行 y
 
-// 主菜单: 数字起卦 / 原文
-static const int MODE_ITEMS = 2;
-static int       modeSel    = 0;      // 0=数字起卦占卜  1=高岛易断原文
+// 主菜单: 数字起卦 / 时间起卦 / 原文
+static const int MODE_ITEMS = 3;
+static int       modeSel    = 0;      // 0=数字起卦占卜  1=时间起卦  2=高岛易断原文
 
 // 数字起卦: 用户自己报的 9 位数字(三组三位数, 顺序 = 下卦 / 上卦 / 动爻)
 static const int DIGITS_N = 9;
@@ -96,6 +111,12 @@ static String    digits   = "";
 static String    g_hint   = "";       // 输入页临时提示(如"每组首位不能为0")
 static unsigned long g_hintUntil = 0;
 static View      tocBack  = LIST;     // 详目按 m 返回到哪个视图
+
+// 时间起卦: 当场输入的 10 位数字 —— 年(4) 月(2) 日(2) 时(2)
+// 本机没有 RTC, 断电必丢时间, 所以不做"记住上次时间": 每次起卦都重新输,
+// 也就不会出现"以为对过时、其实钟已经偏了"这类偏差。
+static const int TDIGITS_N = 10;
+static String    tdigits   = "";
 
 // 详目行内布局: 序号在 x=4, 名称从 x=18 起, 右边界 SPLIT_X-8
 static const int TOC_NUM_X  = 4;
@@ -154,15 +175,24 @@ static const char* GUA8[9]   = { "", "乾", "兑", "离", "震", "巽", "坎", "
 static const char* XIANG8[9] = { "", "天", "泽", "火", "雷", "风", "水", "山", "地" };
 static const char* YAO6[7]   = { "", "初", "二", "三", "四", "五", "上" };
 
+enum CastKind { CK_NUM, CK_TIME };    // 数字卦 / 时间卦
+
 struct CastResult {
-  int  n[3];        // 三组三位数
-  int  r[3];        // 三组余数
+  CastKind kind;    // 用哪种方法起的
+  int  n[3];        // 数字卦: 三组三位数; 时间卦: [0]=年月日之和  [1]=[2]=年月日时之和
+  int  r[3];        // [0]=下卦数(1..8)   [1]=上卦数(1..8)   [2]=动爻(1..6)
   int  idx;         // 本卦索引
   int  dong;        // 动爻 1..6 (1=初爻)
   int  bianIdx;     // 之卦索引
   bool valid;
+  // 以下仅时间卦用
+  int  ty, tm, td, th;   // 用户输入的公历 年 月 日 时(0..23)
+  int  ly, lm, ld;       // 换算出的农历 年 月 日 —— 起卦公式用的就是这三个数
+  bool lleap;            // 该农历月是否闰月(只影响显示)
+  int  tzhi;             // 年支序数 1..12 (子=1), 取的是农历年
+  int  tsc;              // 时辰序数 1..12 (子=1)
 };
-static CastResult g_cast = { {0, 0, 0}, {0, 0, 0}, -1, 1, -1, false };
+static CastResult g_cast = {};
 
 // 由六爻 bits 反查卦在本表的索引（表按周易卦序排列，只能查）
 static int guaIndexFromBits(int bits) {
@@ -177,21 +207,30 @@ static int groupNum3(const String& d, int g) {
   return (d[g * 3] - '0') * 100 + (d[g * 3 + 1] - '0') * 10 + (d[g * 3 + 2] - '0');
 }
 
+// 由「下卦数(内) c.r[0] / 上卦数(外) c.r[1] / 动爻 c.r[2]」补全本卦与之卦。
+// 两种起卦法的差别只在 r[] 怎么算, 组装这一步完全相同, 所以抽出来共用。
+static void assembleCast(CastResult& c) {
+  c.idx     = -1;
+  c.bianIdx = -1;
+  int bits  = XT_BITS[c.r[0]] | (XT_BITS[c.r[1]] << 3);   // 低 3 位=下卦, 高 3 位=上卦
+  c.idx     = guaIndexFromBits(bits);
+  c.dong    = c.r[2];                                     // 1..6, 1=初爻
+  c.bianIdx = (c.idx >= 0) ? guaIndexFromBits(bits ^ (1 << (c.dong - 1))) : -1;
+  c.valid   = (c.idx >= 0 && c.bianIdx >= 0);
+}
+
 // 纯函数: 由 9 位数字算出本卦 / 动爻 / 之卦（不改变全局状态, 供预览与起卦共用）
 static CastResult calcCast(const String& d) {
-  CastResult c = { {0, 0, 0}, {0, 0, 0}, -1, 1, -1, false };
+  CastResult c = {};
+  c.kind = CK_NUM;
   if ((int)d.length() != DIGITS_N) return c;
   for (int i = 0; i < 3; i++) {
     c.n[i] = groupNum3(d, i);
     int m  = (i < 2) ? 8 : 6;
-    int r  = c.n[i] % m;
-    c.r[i] = (r == 0) ? m : r;                       // 除尽记 8 / 记 6
+    int v  = c.n[i] % m;
+    c.r[i] = (v == 0) ? m : v;                       // 除尽记 8 / 记 6
   }
-  int bits  = XT_BITS[c.r[0]] | (XT_BITS[c.r[1]] << 3);   // 第一组=下卦, 第二组=上卦
-  c.idx     = guaIndexFromBits(bits);
-  c.dong    = c.r[2];                                    // 1..6, 1=初爻
-  c.bianIdx = (c.idx >= 0) ? guaIndexFromBits(bits ^ (1 << (c.dong - 1))) : -1;
-  c.valid   = (c.idx >= 0 && c.bianIdx >= 0);
+  assembleCast(c);                                   // 第一组=下卦, 第二组=上卦
   return c;
 }
 
@@ -209,6 +248,140 @@ static void inputAppend(char c) {
 
 static void inputDel() {
   if (digits.length() > 0) digits.remove(digits.length() - 1);
+  g_hint = "";
+  dirty  = true;
+}
+
+// ---------- 时间卦（梅花易数「年月日时起例」）----------
+// 原书(《梅花易数》卷一·年月日时起例)：
+//   「先将年月日之数除八，得余数为上卦；再将年月日时之数除八，得余数为下卦；
+//     又将年月日时之数除六，得余数为动爻。」
+//   上卦(外卦) = (年支数 + 农历月 + 农历日)        ÷ 8 取余，除尽记 8
+//   下卦(内卦) = (年支数 + 农历月 + 农历日 + 时数) ÷ 8 取余，除尽记 8
+//   动爻       = (年支数 + 农历月 + 农历日 + 时数) ÷ 6 取余，除尽记 6
+//
+// 三个数都取**农历**数，这是梅花易数的成法(各家讲义一致)：
+//   年取当年地支数(子1…亥12)、月取农历月序、日取农历日序、时取时辰地支数。
+//   所以界面上让用户输公历(方便看表/看手机)，进程序先 solarToLunar() 换成农历再代入。
+//   例(原书「观梅占」): 辰年十二月十七日申时
+//       年支辰5 + 农历12月 + 农历17日 = 34,  ÷8 余 2 -> 兑(上卦)
+//       再加申时 9      = 43,  ÷8 余 3 -> 离(下卦),  ÷6 余 1 -> 初爻动
+//       -> 泽火革, 初爻动, 之卦泽山咸
+// 余数同样对照先天八卦数(乾1 兑2 离3 震4 巽5 坎6 艮7 坤8)，与数字卦共用 XT_BITS。
+//
+// 另外两点：
+//   ① 年支取**农历年**的年支(正月初一换年)。另有一派按立春分界 —— 那是八字/五运六气
+//      的干支口径，梅花起卦传统用农历年，本实现从之。
+//   ② 时取时辰序数：由输入的 0~23 时换算(23~00 时=子, 01~02=丑, … 21~22=亥)。
+//      子时跨 23:00~00:59 两个日历日：传统把 23:00 之后算作「次日的子时」，
+//      而日数是要进公式的，所以这一点会影响结果。
+//      本实现**不替用户改日期** —— 输入什么日期就用什么日期(可预期、不静默改数据)；
+//      当输入的小时是 23 时，输入页会提示「23时: 传统作次日子时」，
+//      要按传统起就把日期填成次日。
+static const char* ZHI12[13] = { "", "子", "丑", "寅", "卯", "辰", "巳",
+                                     "午", "未", "申", "酉", "戌", "亥" };
+static const char* GAN10[10] = { "甲", "乙", "丙", "丁", "戊",
+                                 "己", "庚", "辛", "壬", "癸" };
+
+// 年 -> 年支序数 1..12 (子=1)。以 4 年为甲子之始(公元 4 年 = 甲子年)。
+// 传进来的必须是**农历年**(公历年会在正月初一前后差一位)。
+static int zhiOfYear(int y) { return ((y - 4) % 12 + 12) % 12 + 1; }
+
+// 年 -> 天干序数 0..9 (甲=0)，同上，取农历年
+static int ganOfYear(int y) { return ((y - 4) % 10 + 10) % 10; }
+
+// 时(0..23) -> 时辰序数 1..12 (子=1)。子时跨 23:00~00:59, 每两小时一个时辰。
+static int shichenOfHour(int h) { return (((h + 1) / 2) % 12) + 1; }
+
+// 农历日的汉字写法: 初一…初十 / 十一…十九 / 二十 / 廿一…廿九 / 三十
+static void lunarDayName(int d, char* out, int n) {
+  static const char* NUM[11] = { "", "一", "二", "三", "四", "五",
+                                 "六", "七", "八", "九", "十" };
+  if (d >= 1 && d <= 10) { snprintf(out, n, "初%s", NUM[d]); return; }
+  if (d == 20)           { snprintf(out, n, "二十");        return; }
+  if (d == 30)           { snprintf(out, n, "三十");        return; }
+  if (d < 20)            { snprintf(out, n, "十%s", NUM[d - 10]); return; }
+  snprintf(out, n, "廿%s", NUM[d - 20]);
+}
+
+// 农历月名: 正月 二月 … 十月 冬月 腊月
+static const char* lunarMonthName(int m) {
+  static const char* MN[13] = { "", "正月", "二月", "三月", "四月", "五月", "六月",
+                                "七月", "八月", "九月", "十月", "冬月", "腊月" };
+  return (m >= 1 && m <= 12) ? MN[m] : "?";
+}
+
+// 农历日期写成一行: "丙午年八月初七" / "乙巳年闰六月廿三"
+static void lunarText(const LunarDate& ld, char* out, int n) {
+  char day[12];
+  lunarDayName(ld.day, day, sizeof(day));
+  snprintf(out, n, "%s%s年%s%s%s",
+           GAN10[ganOfYear(ld.year)], ZHI12[zhiOfYear(ld.year)],
+           ld.leap ? "闰" : "", lunarMonthName(ld.month), day);
+}
+
+// 某年某月的天数(含闰年二月)
+static int daysInMonth(int y, int m) {
+  static const int D[13] = { 0, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31 };
+  if (m < 1 || m > 12) return 0;
+  if (m == 2 && ((y % 4 == 0 && y % 100 != 0) || y % 400 == 0)) return 29;
+  return D[m];
+}
+
+// 时间输入的 10 位数字 -> 年月日时
+static int tYear () { return tdigits.substring(0, 4).toInt(); }
+static int tMonth() { return tdigits.substring(4, 6).toInt(); }
+static int tDay  () { return tdigits.substring(6, 8).toInt(); }
+static int tHour () { return tdigits.substring(8, 10).toInt(); }
+
+// 数字是否已经输满(与合法性分开判断: 没输满不算错, 只是还不能起卦)
+static bool tReady() { return (int)tdigits.length() >= TDIGITS_N; }
+
+// 合法性校验: 返回 nullptr = 合法或尚未输满, 否则返回要显示的提示语
+// 注: 输入的是公历, 但起卦要换成农历, 所以还必须落在农历表覆盖范围内(1900-01-31 起)
+static const char* tError() {
+  if (!tReady()) return nullptr;
+  int y = tYear(), m = tMonth(), d = tDay(), h = tHour();
+  if (y < 1900 || y > 2100) return "年份需 1900-2100";
+  if (m < 1 || m > 12)      return "月份需 01-12";
+  if (d < 1)                return "日期需 01 起";
+  if (d > daysInMonth(y, m)) return "该月没有这一天";
+  if (h > 23)               return "小时需 00-23";
+  if (!solarToLunar(y, m, d).ok) return "农历表自 1900-01-31 起";
+  return nullptr;
+}
+
+// 纯函数: 由公历 年月日时 算出本卦 / 动爻 / 之卦（不改变全局状态）
+// 先换成农历 —— 公式里的「月、日」要的是农历数(见上方说明)。
+static CastResult calcCastByTime(int y, int m, int d, int h) {
+  CastResult c = {};
+  c.kind = CK_TIME;
+  c.ty = y; c.tm = m; c.td = d; c.th = h;
+  LunarDate ld = solarToLunar(y, m, d);
+  if (!ld.ok) return c;                 // valid 留 false, 由调用方出提示
+  c.ly = ld.year; c.lm = ld.month; c.ld = ld.day; c.lleap = ld.leap;
+  c.tzhi = zhiOfYear(ld.year);          // 年支取农历年
+  c.tsc  = shichenOfHour(h);
+  int a = c.tzhi + c.lm + c.ld;         // 年月日之数(农历)
+  int b = a + c.tsc;                    // 年月日时之数
+  c.n[0] = a; c.n[1] = b; c.n[2] = b;
+  int r0 = b % 8; c.r[0] = (r0 == 0) ? 8 : r0;   // 下卦(内卦) = 年月日时
+  int r1 = a % 8; c.r[1] = (r1 == 0) ? 8 : r1;   // 上卦(外卦) = 年月日
+  int r2 = b % 6; c.r[2] = (r2 == 0) ? 6 : r2;   // 动爻
+  assembleCast(c);
+  return c;
+}
+
+// 时间输入页: 追加一位数字
+static void tInputAppend(char c) {
+  if ((int)tdigits.length() >= TDIGITS_N) return;
+  tdigits += c;
+  g_hint   = "";           // 有新输入就撤掉上一次的提示
+  dirty    = true;
+}
+
+static void tInputDel() {
+  if (tdigits.length() > 0) tdigits.remove(tdigits.length() - 1);
   g_hint = "";
   dirty  = true;
 }
@@ -391,7 +564,7 @@ void clampListTop() {
 // 起卦页 / 输入页没有"行/页"可翻, 方向键在此无效
 void lineUp() {                                   // 上移一行 / 上移一项
   if (view == MODE)      { if (modeSel > 0) { --modeSel; dirty = true; } return; }
-  if (view == CAST || view == INPUT9) return;
+  if (view == CAST || view == INPUT9 || view == INPUTT) return;
   if (view == LIST)      { if (sel > 0) --sel; clampListTop(); }
   else if (view == TOC)  { if (tocSel > 0) { --tocSel; tocScrollReset(); } }
   else                   { if (detailTop > 0) --detailTop; }
@@ -399,7 +572,7 @@ void lineUp() {                                   // 上移一行 / 上移一项
 }
 void lineDown() {                                 // 下移一行 / 下移一项
   if (view == MODE)      { if (modeSel < MODE_ITEMS - 1) { ++modeSel; dirty = true; } return; }
-  if (view == CAST || view == INPUT9) return;
+  if (view == CAST || view == INPUT9 || view == INPUTT) return;
   if (view == LIST)      { if (sel < 63) ++sel; clampListTop(); }
   else if (view == TOC)  { if (tocSel < SEC_COUNT - 1) { ++tocSel; tocScrollReset(); } }
   else                   { ++detailTop; }
@@ -407,7 +580,7 @@ void lineDown() {                                 // 下移一行 / 下移一项
 }
 void pageUp() {                                   // 左键
   if (view == MODE)      { modeSel = (modeSel + MODE_ITEMS - 1) % MODE_ITEMS; dirty = true; return; }
-  if (view == CAST || view == INPUT9) return;
+  if (view == CAST || view == INPUT9 || view == INPUTT) return;
   if (view == LIST)      { sel -= LIST_ROWS; if (sel < 0) sel = 0; clampListTop(); }
   else if (view == TOC)  { if (sel > 0) { --sel; tocSel = 0; tocScrollReset(); } }  // 上一卦
   else                   { detailTop -= DETAIL_ROWS; if (detailTop < 0) detailTop = 0; }
@@ -415,7 +588,7 @@ void pageUp() {                                   // 左键
 }
 void pageDown() {                                 // 右键
   if (view == MODE)      { modeSel = (modeSel + 1) % MODE_ITEMS; dirty = true; return; }
-  if (view == CAST || view == INPUT9) return;
+  if (view == CAST || view == INPUT9 || view == INPUTT) return;
   if (view == LIST)      { sel += LIST_ROWS; if (sel > 63) sel = 63; clampListTop(); }
   else if (view == TOC)  { if (sel < 63) { ++sel; tocSel = 0; tocScrollReset(); } } // 下一卦
   else                   { detailTop += DETAIL_ROWS; }
@@ -666,11 +839,12 @@ void drawSplash() {
   M5Cardputer.Display.setTextColor(C_HINT);
   M5Cardputer.Display.drawCentreString("Takashima Ekidan", 120, 56);
   M5Cardputer.Display.setTextColor(C_TEXT);
-  M5Cardputer.Display.drawCentreString("数字起卦 · 64 卦全文", 120, 88);
+  M5Cardputer.Display.drawCentreString("数字/时间 起卦 · 64 卦全文", 120, 88);
   drawBattery();
 }
 
-// 主菜单: 1 数字起卦占卜 / 2 高岛易断原文
+// 主菜单: 1 数字起卦占卜 / 2 时间起卦 / 3 高岛易断原文
+// 三项 + 说明行要挤在 135px 高里, 所以行距压到 26, 说明行放在最后两行。
 void drawMode() {
   M5Cardputer.Display.fillScreen(C_BG);
   M5Cardputer.Display.setTextColor(C_TITLE);
@@ -680,12 +854,12 @@ void drawMode() {
   M5Cardputer.Display.drawRightString("上下选 Enter确定", 200, 3);
   M5Cardputer.Display.setFont(&lgfx::fonts::efontCN_14);
 
-  const char* items[MODE_ITEMS] = { "数字起卦占卜", "高岛易断原文" };
+  const char* items[MODE_ITEMS] = { "数字起卦占卜", "时间起卦", "高岛易断原文" };
   for (int i = 0; i < MODE_ITEMS; i++) {
-    int  y  = 44 + i * 28;
+    int  y  = 30 + i * 26;
     bool hl = (i == modeSel);
     if (hl) {
-      M5Cardputer.Display.fillRect(0, y - 4, 240, 26, C_HL);
+      M5Cardputer.Display.fillRect(0, y - 4, 240, 24, C_HL);
       M5Cardputer.Display.setTextColor(C_HL_TXT);
     } else {
       M5Cardputer.Display.setTextColor(C_TEXT);
@@ -698,11 +872,14 @@ void drawMode() {
   M5Cardputer.Display.setFont(&lgfx::fonts::efontCN_12);
   M5Cardputer.Display.setTextColor(C_HINT);
   if (modeSel == 0) {
-    M5Cardputer.Display.drawString("傅佩荣随机数起卦法", 8, 100);
-    M5Cardputer.Display.drawString("报 9 位数字 → 本卦·动爻·之卦", 8, 115);
+    M5Cardputer.Display.drawString("傅佩荣随机数起卦法", 8, 108);
+    M5Cardputer.Display.drawString("报 9 位数字 → 本卦·动爻·之卦", 8, 121);
+  } else if (modeSel == 1) {
+    M5Cardputer.Display.drawString("梅花易数 年月日时起例", 8, 108);
+    M5Cardputer.Display.drawString("输公历 年月日时(10位) → 本卦·动爻", 8, 121);
   } else {
-    M5Cardputer.Display.drawString("《高岛易断》64 卦全文", 8, 100);
-    M5Cardputer.Display.drawString("查卦辞 / 六爻占断", 8, 115);
+    M5Cardputer.Display.drawString("《高岛易断》64 卦全文", 8, 108);
+    M5Cardputer.Display.drawString("查卦辞 / 六爻占断", 8, 121);
   }
   M5Cardputer.Display.setFont(&lgfx::fonts::efontCN_14);
 
@@ -763,7 +940,104 @@ void drawInput() {
   }
 
   M5Cardputer.Display.setFont(&lgfx::fonts::efontCN_14);
-  drawFooter("Enter起卦 del退格 m返回", 1);
+  drawFooter("Enter:起卦 del:退格 m:返回", 1);
+  drawBattery();
+}
+
+// 时间起卦: 输入 10 位数字 —— 年(4位) 月(2位) 日(2位) 时(2位)
+// 与数字起卦不同, 时间起卦的依据是客观时间, 没有"盲报"的必要, 所以这里实时回显
+// 换算出的「年支 / 时辰」, 方便当场核对; 但同样不透卦象 ——
+// 本卦 / 动爻 / 之卦一律等到起卦结果页才揭晓。
+void drawInputTime() {
+  M5Cardputer.Display.fillScreen(C_BG);
+  M5Cardputer.Display.setTextColor(C_TITLE);
+  M5Cardputer.Display.drawString("时间起卦", 2, 0);
+  M5Cardputer.Display.setFont(&lgfx::fonts::efontCN_12);
+  M5Cardputer.Display.setTextColor(C_HINT);
+  M5Cardputer.Display.drawRightString("公历年月日时", 200, 3);
+
+  // 四个格: 年占 4 位, 月/日/时 各占 2 位; 格子宽度按位数给, 整体居中
+  const char* lab[4] = { "年", "月", "日", "时" };
+  const int   bw [4] = { 44, 30, 30, 30 };
+  const int   nd [4] = { 4, 2, 2, 2 };
+  const int   bi [4] = { 0, 4, 6, 8 };          // 每格首位在 tdigits 里的下标
+  int bx[4], xx = 41;
+  for (int g = 0; g < 4; g++) { bx[g] = xx; xx += bw[g] + 8; }
+
+  const int bh = 28, by = 38;
+  int len = (int)tdigits.length();
+
+  // 当前正在输入的是第几格(actG)、格内第几位(actK)
+  int actG = 0, acc = 0;
+  for (int g = 0; g < 4; g++) {
+    if (len < acc + nd[g]) { actG = g; break; }
+    acc += nd[g];
+    actG = g;
+  }
+
+  char buf[48];
+  for (int g = 0; g < 4; g++) {
+    bool active = (len < TDIGITS_N) && (g == actG);
+    M5Cardputer.Display.drawRoundRect(bx[g], by, bw[g], bh, 3, active ? C_TITLE : C_GRID);
+
+    M5Cardputer.Display.setFont(&lgfx::fonts::efontCN_14);
+    int dw  = nd[g] * 7;                        // 14px 字体每位数字 7px 宽
+    int dx0 = bx[g] + (bw[g] - dw) / 2;
+    for (int k = 0; k < nd[g]; k++) {
+      int gi = bi[g] + k;
+      int x  = dx0 + k * 7;
+      if (gi < len) {
+        M5Cardputer.Display.setTextColor(active ? C_TITLE : C_TEXT);
+        char s[2] = { tdigits[gi], 0 };
+        M5Cardputer.Display.drawString(s, x, by + 6);
+      } else {                                  // 未输入: 短下划线
+        M5Cardputer.Display.fillRect(x + 1, by + bh - 9, 5, 1, C_GRID);
+      }
+    }
+
+    M5Cardputer.Display.setFont(&lgfx::fonts::efontCN_12);
+    M5Cardputer.Display.setTextColor(active ? C_TITLE : C_HINT);
+    M5Cardputer.Display.drawCentreString(lab[g], bx[g] + bw[g] / 2, by + bh + 4);
+  }
+
+  // 回显: 把输入的公历换成农历报出来 —— 起卦公式取的是农历月 / 农历日, 便于当场核对
+  M5Cardputer.Display.setFont(&lgfx::fonts::efontCN_12);
+  M5Cardputer.Display.setTextColor(C_TEXT);
+  buf[0] = 0;
+  if (len >= 8 && !tError()) {
+    LunarDate ldIn = solarToLunar(tYear(), tMonth(), tDay());
+    if (ldIn.ok) {
+      char lt[32];
+      lunarText(ldIn, lt, sizeof(lt));
+      snprintf(buf, sizeof(buf), "农历 %s", lt);
+      if (len >= TDIGITS_N && tHour() <= 23)
+        snprintf(buf + strlen(buf), sizeof(buf) - strlen(buf), " %s时",
+                 ZHI12[shichenOfHour(tHour())]);
+    }
+  }
+  if (buf[0]) M5Cardputer.Display.drawCentreString(buf, 120, 88);
+
+  // 状态行: 提示(红色) > 校验错误(红色) > 23时的历法提醒(黄) > 输满(黄) > 还差几位(灰)
+  const char* err = (len >= TDIGITS_N) ? tError() : nullptr;
+  bool lateZi = (len >= TDIGITS_N && !err && tHour() == 23);
+  if (g_hint.length() || err) {
+    M5Cardputer.Display.setTextColor(C_HEX_HL);
+    M5Cardputer.Display.drawCentreString(g_hint.length() ? g_hint.c_str() : err, 120, 102);
+  } else if (lateZi) {
+    // 子时跨两个日历日, 传统把 23:00 之后算次日子时 —— 日数进公式, 这里必须说清楚
+    M5Cardputer.Display.setTextColor(C_TITLE);
+    M5Cardputer.Display.drawCentreString("23时: 传统作次日子时", 120, 102);
+  } else if (len >= TDIGITS_N) {
+    M5Cardputer.Display.setTextColor(C_TITLE);
+    M5Cardputer.Display.drawCentreString("输满了, 按 Enter 起卦", 120, 102);
+  } else {
+    M5Cardputer.Display.setTextColor(C_GRID);
+    snprintf(buf, sizeof(buf), "还需输入 %d 位", TDIGITS_N - len);
+    M5Cardputer.Display.drawCentreString(buf, 120, 102);
+  }
+
+  M5Cardputer.Display.setFont(&lgfx::fonts::efontCN_14);
+  drawFooter("Enter:起卦 del:退格 m:返回", 1);
   drawBattery();
 }
 
@@ -792,18 +1066,19 @@ void drawList() {
   // 右侧卦象区
   M5Cardputer.Display.drawLine(SPLIT_X, 20, SPLIT_X, 116, C_GRID);
   drawHexagramFig(sel, 166, 58, 24, 104, C_HEX);
-  drawFooter("输号 Enter选 上下行 m返回", 1);
+  drawFooter("输号 Enter:选 上下行 m:返回", 1);
   drawBattery();
 }
 
-// 起卦结果页: 用户报的三组数 -> 下卦/上卦/动爻 -> 本卦, 右侧画本卦六爻(动爻高亮)
+// 起卦结果页: 把起卦依据 -> 下卦/上卦/动爻 -> 本卦摊开, 右侧画本卦六爻(动爻高亮)
+// 两种方法共用这一页, 左边的"依据"部分按 g_cast.kind 分岔。
 void drawCast() {
   M5Cardputer.Display.fillScreen(C_BG);
   M5Cardputer.Display.setTextColor(C_TITLE);
   M5Cardputer.Display.drawString("起卦结果", 2, 0);
   M5Cardputer.Display.setFont(&lgfx::fonts::efontCN_12);
   M5Cardputer.Display.setTextColor(C_HINT);
-  M5Cardputer.Display.drawRightString("傅佩荣数字卦", 200, 3);
+  M5Cardputer.Display.drawRightString(g_cast.kind == CK_TIME ? "梅花时间卦" : "傅佩荣数字卦", 200, 3);
   M5Cardputer.Display.setFont(&lgfx::fonts::efontCN_14);
 
   if (!g_cast.valid) {                       // 兜底: 正常不会走到
@@ -811,52 +1086,98 @@ void drawCast() {
     M5Cardputer.Display.setTextColor(C_HINT);
     M5Cardputer.Display.drawString("换算异常, 按 r 重新输入", 2, 40);
     M5Cardputer.Display.setFont(&lgfx::fonts::efontCN_14);
-    drawFooter("r改数字 m返回", 1);
+    drawFooter("r:改依据 m:返回", 1);
     drawBattery();
     return;
   }
 
   char buf[64];
   M5Cardputer.Display.setFont(&lgfx::fonts::efontCN_12);
-  // 三组数: 第一组定下卦, 第二组定上卦, 第三组定动爻
-  for (int i = 0; i < 3; i++) {
-    int y = 20 + i * 15;
-    if (i < 2) {
-      snprintf(buf, sizeof(buf), "%s卦 %d/8 余%d %s(%s)",
-               (i == 0) ? "下" : "上", g_cast.n[i], g_cast.r[i],
-               GUA8[g_cast.r[i]], XIANG8[g_cast.r[i]]);
-    } else {
-      snprintf(buf, sizeof(buf), "动爻 %d/6 余%d %s爻",
-               g_cast.n[i], g_cast.r[i], YAO6[g_cast.r[i]]);
-    }
+
+  if (g_cast.kind == CK_TIME) {
+    // 时间卦: 把推导过程摊开 —— 时间 -> 年月日 / 年月日时 -> 上卦 / 下卦 / 动爻
+    int a = g_cast.n[0];                     // 年月日之数
+    int b = g_cast.n[1];                     // 年月日时之数
     M5Cardputer.Display.setTextColor(C_HINT);
-    M5Cardputer.Display.drawString(buf, 2, y);
+    snprintf(buf, sizeof(buf), "公历 %04d-%02d-%02d %02d时",
+             g_cast.ty, g_cast.tm, g_cast.td, g_cast.th);
+    drawText(buf, 2, 18);
+    // 换算出的农历 —— 起卦公式用的正是农历月 / 农历日
+    LunarDate ld = {};
+    ld.year = g_cast.ly; ld.month = g_cast.lm; ld.day = g_cast.ld;
+    ld.leap = g_cast.lleap; ld.ok = true;
+    char lt[32];
+    lunarText(ld, lt, sizeof(lt));
+    snprintf(buf, sizeof(buf), "农历 %s %s时", lt, ZHI12[g_cast.tsc]);
+    drawText(buf, 2, 31);
+
+    M5Cardputer.Display.setTextColor(C_TEXT);
+    snprintf(buf, sizeof(buf), "上卦 %d/8 余%d %s(%s)",          // 上卦 = 年月日
+             a, g_cast.r[1], GUA8[g_cast.r[1]], XIANG8[g_cast.r[1]]);
+    drawText(buf, 2, 45);
+    snprintf(buf, sizeof(buf), "下卦 %d/8 余%d %s(%s)",          // 下卦 = 年月日时
+             b, g_cast.r[0], GUA8[g_cast.r[0]], XIANG8[g_cast.r[0]]);
+    drawText(buf, 2, 58);
+    snprintf(buf, sizeof(buf), "动爻 %d/6 余%d %s爻",            // 动爻 = 年月日时
+             b, g_cast.r[2], YAO6[g_cast.r[2]]);
+    drawText(buf, 2, 71);
+
+    M5Cardputer.Display.drawLine(0, 85, 168, 85, C_GRID);
+
+    // 本卦
+    M5Cardputer.Display.setFont(&lgfx::fonts::efontCN_14);
+    M5Cardputer.Display.setTextColor(C_TITLE);
+    snprintf(buf, sizeof(buf), "%s 第%d卦",
+             HEXAGRAMS[g_cast.idx].name, HEXAGRAMS[g_cast.idx].num);
+    drawText(buf, 2, 89);
+
+    // 动爻与之卦
+    M5Cardputer.Display.setFont(&lgfx::fonts::efontCN_12);
+    M5Cardputer.Display.setTextColor(C_TEXT);
+    snprintf(buf, sizeof(buf), "%s爻动 -> 之卦 %s", YAO6[g_cast.dong],
+             (g_cast.bianIdx >= 0) ? HEXAGRAMS[g_cast.bianIdx].name : "?");
+    drawText(buf, 2, 105);
+  } else {
+    // 数字卦: 三组数 —— 第一组定下卦, 第二组定上卦, 第三组定动爻
+    for (int i = 0; i < 3; i++) {
+      int y = 20 + i * 15;
+      if (i < 2) {
+        snprintf(buf, sizeof(buf), "%s卦 %d/8 余%d %s(%s)",
+                 (i == 0) ? "下" : "上", g_cast.n[i], g_cast.r[i],
+                 GUA8[g_cast.r[i]], XIANG8[g_cast.r[i]]);
+      } else {
+        snprintf(buf, sizeof(buf), "动爻 %d/6 余%d %s爻",
+                 g_cast.n[i], g_cast.r[i], YAO6[g_cast.r[i]]);
+      }
+      M5Cardputer.Display.setTextColor(C_HINT);
+      M5Cardputer.Display.drawString(buf, 2, y);
+    }
+    M5Cardputer.Display.drawLine(0, 66, 168, 66, C_GRID);
+
+    // 本卦
+    M5Cardputer.Display.setFont(&lgfx::fonts::efontCN_14);
+    M5Cardputer.Display.setTextColor(C_TITLE);
+    snprintf(buf, sizeof(buf), "%s 第%d卦",
+             HEXAGRAMS[g_cast.idx].name, HEXAGRAMS[g_cast.idx].num);
+    drawText(buf, 2, 70);
+
+    // 动爻与之卦
+    M5Cardputer.Display.setFont(&lgfx::fonts::efontCN_12);
+    M5Cardputer.Display.setTextColor(C_TEXT);
+    snprintf(buf, sizeof(buf), "%s爻动 -> 之卦 %s", YAO6[g_cast.dong],
+             (g_cast.bianIdx >= 0) ? HEXAGRAMS[g_cast.bianIdx].name : "?");
+    drawText(buf, 2, 92);
+
+    M5Cardputer.Display.setTextColor(C_GRID);
+    M5Cardputer.Display.drawString("断卦: 本卦+动爻+之卦", 2, 104);
   }
-  M5Cardputer.Display.drawLine(0, 66, 168, 66, C_GRID);
-
-  // 本卦
-  M5Cardputer.Display.setFont(&lgfx::fonts::efontCN_14);
-  M5Cardputer.Display.setTextColor(C_TITLE);
-  snprintf(buf, sizeof(buf), "%s 第%d卦",
-           HEXAGRAMS[g_cast.idx].name, HEXAGRAMS[g_cast.idx].num);
-  drawText(buf, 2, 70);
-
-  // 动爻与之卦
-  M5Cardputer.Display.setFont(&lgfx::fonts::efontCN_12);
-  M5Cardputer.Display.setTextColor(C_TEXT);
-  snprintf(buf, sizeof(buf), "%s爻动 -> 之卦 %s", YAO6[g_cast.dong],
-           (g_cast.bianIdx >= 0) ? HEXAGRAMS[g_cast.bianIdx].name : "?");
-  drawText(buf, 2, 92);
-
-  M5Cardputer.Display.setTextColor(C_GRID);
-  M5Cardputer.Display.drawString("断卦: 本卦+动爻+之卦", 2, 104);
 
   M5Cardputer.Display.setFont(&lgfx::fonts::efontCN_14);
 
   // 右侧: 本卦六爻图, 动爻红色高亮
   drawHexagramFig(g_cast.idx, 178, 48, 24, 100, C_HEX, g_cast.dong - 1);
 
-  drawFooter("Enter本卦 b之卦 r改数 m返回", 1);
+  drawFooter("Enter:本卦 b:之卦 r:改依据 m:返回", 1);
   drawBattery();
 }
 
@@ -933,7 +1254,7 @@ void drawDetail() {
     drawText(detailLines[li].c_str(), 2, HEADER_H + r * ROW_H);
   }
   char foot[48];
-  snprintf(foot, sizeof(foot), "%d/%d 上下行 左右页 m返回",
+  snprintf(foot, sizeof(foot), "%d/%d 上下行 左右页 m:返回",
            detailTop + 1, (int)detailLines.size());
   drawFooter(foot);
   drawBattery();
@@ -946,6 +1267,7 @@ void redraw() {
     case LIST:   drawList();   break;
     case CAST:   drawCast();   break;
     case INPUT9:  drawInput();  break;
+    case INPUTT:  drawInputTime(); break;
     case TOC:    drawToc();    break;
     default:     drawDetail(); break;
   }
@@ -959,12 +1281,13 @@ void handleKeys() {
     if (c >= '0' && c <= '9') {
       if (view == LIST)       { if (inputBuf.length() < 2) inputBuf += c; }   // 最多两位
       else if (view == INPUT9) { inputAppend(c); }
+      else if (view == INPUTT) { tInputAppend(c); }
     } else if (c == 'n' || c == 'N') {
       lineDown();
     } else if (c == 'p' || c == 'P') {
       lineUp();
     } else if (c == 'r' || c == 'R') {
-      if (view == CAST) { view = INPUT9; dirty = true; }          // 回去改数字
+      if (view == CAST) { view = (g_cast.kind == CK_TIME) ? INPUTT : INPUT9; dirty = true; }
     } else if (c == 'b' || c == 'B') {
       if (view == CAST && g_cast.valid && g_cast.bianIdx >= 0) {  // 直接看之卦
         openToc(g_cast.bianIdx, g_cast.dong, CAST);
@@ -975,6 +1298,7 @@ void handleKeys() {
       else if (view == LIST)   { view = MODE; inputBuf = ""; dirty = true; }
       else if (view == CAST)   { view = MODE; dirty = true; }
       else if (view == INPUT9)  { view = MODE; g_hint = ""; dirty = true; }
+      else if (view == INPUTT)  { view = MODE; g_hint = ""; dirty = true; }
     }
     // 方向键(键盘丝印箭头):  ; = 上   . = 下   , = 左   / = 右
     else if (c == ';') { lineUp();   }              // 上: 一行
@@ -984,12 +1308,18 @@ void handleKeys() {
   }
 
   if (view == INPUT9 && ks.del) inputDel();          // 退格(backspace 不进 word)
+  if (view == INPUTT && ks.del) tInputDel();
 
   if (ks.enter) {
     if (view == MODE) {
       if (modeSel == 0) {                    // 数字起卦: 从零开始报数
         view = INPUT9;
         digits = "";
+        g_hint = "";
+        dirty = true;
+      } else if (modeSel == 1) {             // 时间起卦: 每次重新输年月日时
+        view = INPUTT;
+        tdigits = "";
         g_hint = "";
         dirty = true;
       } else              { view = LIST;  dirty = true; }   // 原文
@@ -1000,6 +1330,17 @@ void handleKeys() {
         dirty       = true;
       } else {
         g_cast = calcCast(digits);
+        if (g_cast.valid) { view = CAST; g_hint = ""; dirty = true; }
+        else { g_hint = "换算失败, 请重输"; g_hintUntil = millis() + 1500; dirty = true; }
+      }
+    } else if (view == INPUTT) {
+      const char* err = tReady() ? tError() : "需输满 10 位数字";
+      if (err) {
+        g_hint      = err;
+        g_hintUntil = millis() + 1500;
+        dirty       = true;
+      } else {
+        g_cast = calcCastByTime(tYear(), tMonth(), tDay(), tHour());
         if (g_cast.valid) { view = CAST; g_hint = ""; dirty = true; }
         else { g_hint = "换算失败, 请重输"; g_hintUntil = millis() + 1500; dirty = true; }
       }
@@ -1070,7 +1411,7 @@ void loop() {
   // 输入页的临时提示到时自动消失
   if (g_hint.length() && millis() > g_hintUntil) {
     g_hint = "";
-    if (view == INPUT9) dirty = true;
+    if (view == INPUT9 || view == INPUTT) dirty = true;
   }
   if (dirty) redraw();
 
