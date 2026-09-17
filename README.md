@@ -123,7 +123,20 @@ if (digits.length() % 3 == 0 && c == '0') return;    // 每组首位非 0
 
 ## 中文显示（关键技巧）
 - **M5GFX 库自带简体中文 efont 点阵字库**（`lgfx::fonts::efontCN_12/14/16/24`），
-  直接 `setFont(&lgfx::fonts::efontCN_14)` 即可显示中文，**无需自己生成/外接字库**。
+  直接 `setFont(&lgfx::fonts::efontCN_14)` 即可显示中文。
+- ⚠️ **但 efont 只收 GB2312 那一档（约 7500 字）**：本书正文里有 **163 个生僻字**
+  （姤、夬、禴、繘…）它没有，而 M5GFX 遇到缺字会调 `drawCharDummy` 画一个**方块 □**。
+  解法是从系统宋体点阵生成一份 u8g2 格式的**补字字体** `src/sup_font.h`，
+  `drawTextOn()` 在 efont 查不到该码点时逐字切到补字字体绘制。
+  （两档字号各 163 字形，共约 27KB Flash；整串不含缺字时直接走原 `drawString`，
+  渲染结果与未打补丁时逐像素一致。）
+- **几何对齐**（`_mkfont.py` 按此生成，否则字会错位）：
+  `xo = 宋体墨迹左列 + 偏置`（14px 偏置 = 1、12px 偏置 = 0 —— 两档出自不同生成管线）、
+  `w = 墨迹宽`、`yo = (ascent − 墨迹顶行) − 墨迹高`。
+- **混排绘制时每段必须临时用 `\0` 截断**再 `drawString`：各段重编码后是紧挨着存在同一个
+  缓冲区里的，只有整串末尾有终止符；不截断就会把「本段起点 → 整串末尾」整段重画一遍，
+  表现为**字形上叠着一堆方块**。
+- **改动文案后要重跑 `python _mkfont.py`**，否则新出现的生僻字仍是方块。
 - 文本以 `const char*`（UTF-8）烧进 Flash，运行时按字数折行、分页滚动。
 - 详目页行高在 `setup()` 里按 `fontHeight()` **实测**取值（并夹紧到 7 行刚好放得下），
   不写死，避免换字号后 7 行溢出屏幕。
@@ -136,26 +149,44 @@ if (digits.length() % 3 == 0 && c == '0') return;    // 每组首位非 0
 ## 工程文件
 | 文件 | 说明 |
 |---|---|
-| `platformio.ini` | 本地 M5Stack 平台（`D:/cardputer/platform-m5stack`）+ `m5stack_cardputer` 板型 |
+| `platformio.ini` | 构建配置：官方 `espressif32@6.5.0` 平台 + `m5stack_cardputer` 板型 |
+| `boards/m5stack_cardputer.json` | **板型清单**（官方平台里没有，随项目自带） |
+| `variants/m5stack_cardputer/pins_arduino.h` | **Cardputer 引脚定义**（同上。这两个文件是别人能编译的关键） |
 | `partitions.csv` | 8MB Flash 最大 app 分区（`max_app_8MB`，~7.9MB），突破默认 1.25MB 上限 |
 | `src/main.cpp` | 主程序：主菜单 / 数字输入 / 起卦结果 / 三层视图、卦象绘制、电量显示 |
 | `src/gddy_data.h` | 自动生成的 64 卦 × 7 段数据 |
+| `src/sup_font.h` | **补字字体**：163 个 efont 缺字的点阵（见「中文显示」） |
 | `_build.py` | **数据重建脚本**：`raw/*.html` → `src/gddy_data.h` |
 | `_verify.py` | **数据校验脚本**：段数 / 标签 / 目录名宽度 / 正文非空 |
 | `_cast_check.py` | **起卦换算回归脚本**：六爻解析双射性 + 三个公开示例 + 随机分布 |
+| `_mkfont.py` | **补字字体生成脚本**：扫描全语料缺字 → `src/sup_font.h`（自带像素级回验） |
+| `_efont.py` | u8g2/efont 点阵字库读取器（`_mkfont.py` 的依赖，也可单独做字形预览） |
 | `raw/` | 64 卦原始 HTML（留档） |
+
+## 环境准备（为什么项目里带 `boards/` 和 `variants/`）
+Cardputer 的板型**不在**官方 `platform-espressif32` 里（6.5.0 和最新的 7.1.3 都查过，都没有），
+M5GFX 的框架包里也不带 `m5stack_cardputer` 这个 variant。所以本项目把它们随源码一起带上：
+
+- `boards/m5stack_cardputer.json` —— PlatformIO 会自动搜索**项目根**的 `boards/` 目录；
+- `variants/m5stack_cardputer/pins_arduino.h` —— 靠板型 JSON 里的
+  `"build.variants_dir": "variants"` 指定路径，框架的 `platformio-build.py` 会把它读成
+  `$PROJECT_DIR/variants/`，**不需要往全局的 `framework-arduinoespressif32` 包里注入任何文件**。
+
+所以 clone 下来直接 `pio run` 就行，不必手工配置平台。
 
 ## 构建与烧录
 ```bat
-python D:/cardputer/gddy/_build.py        # 需要时重建数据
-python D:/cardputer/gddy/_verify.py       # 校验数据(输出 _verify.out)
-python D:/cardputer/gddy/_cast_check.py   # 校验数字卦换算(输出 _cast_check.out)
-pio run -d D:/cardputer/gddy              # 编译  (Flash ~30%)
-pio run -d D:/cardputer/gddy -t upload    # 烧录（插线；必要时按住侧面 G0/BOOT 进下载模式）
-pio device monitor -b 115200              # 看串口
+pio run                              # 编译  (Flash ~30%)
+pio run -t upload                    # 烧录（插线；必要时按住侧面 G0/BOOT 进下载模式）
+pio device monitor -b 115200         # 看串口
+
+python _build.py                     # 需要时重建数据 raw/*.html -> src/gddy_data.h
+python _verify.py                    # 校验数据(输出 _verify.out)
+python _cast_check.py                # 校验数字卦换算(输出 _cast_check.out)
+python _mkfont.py                    # 改文案后重建补字字体 -> src/sup_font.h
 ```
-> 若日后 `pio platform update` 把框架升级、编译报 `pins_arduino.h` 缺失，跑一次
-> `python D:/cardputer/fix_variant.py` 重注入 Cardputer 板型头文件。
+> `_mkfont.py` / `_efont.py` 需要 Pillow；`_efont.py` 会从 `.pio/libdeps/` 里定位 efont 数据，
+> 所以先跑一次 `pio run` 让依赖就位。
 
 ## 在 velxio.dev 预览
 velxio 的 Cardputer ADV 用同款 `M5Cardputer` 库，`src/main.cpp` 可直接粘进

@@ -1,0 +1,28 @@
+# ---- PlatformIO 构建产物与依赖包(本机 331MB, 绝不提交) ----
+.pio/
+
+# ---- 脚本输出的报告 / 构建日志 ----
+_build.out
+_verify.out
+_cast_check.out
+_mkfont.out
+*.log
+
+# ---- 临时调试目录 ----
+_scratch/
+
+# ---- 数据重建时留下的备份 ----
+src/gddy_data.h.bak
+
+# ---- 调试过程的中间图片(这些是排查时随手生成的, 不必入库) ----
+_cmp_jiugou.png
+_sim.png
+_sim_b.png
+_sim_buggy.png
+_sup_screen.png
+
+# ---- 编辑器 / 操作系统 ----
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

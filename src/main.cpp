@@ -47,6 +47,7 @@
 #include <cstring>
 #include <cstdio>
 #include "gddy_data.h"
+#include "sup_font.h"          // 补字字体(efont 缺的生僻字), 由 _mkfont.py 生成
 
 // ---------- UI 常量 ----------
 static const int ROW_H         = 16;    // 正文行高
@@ -421,6 +422,163 @@ void pageDown() {                                 // 右键
   dirty = true;
 }
 
+// ---------- 补字字体: efont 缺字的兜底 ----------
+// M5GFX 自带的 efont 简体字库只收 GB2312 那一档(约 7500 字)。《高岛易断》正文里有 160 多个
+// 生僻字(姤 / 夬 / 禴 / 繘…), efont 查不到, U8g2font::drawChar 就调 drawCharDummy 画一个
+// 方块 —— 屏幕上那些"缺字方块 □"就是它, 不是数据坏了。
+//
+// sup_font.h 由 _mkfont.py 从系统宋体 12px/14px 点阵生成, 两档字号与 efontCN_12/_14 一一对应。
+// 下面这套小工具在遇到缺字时逐字切到补字字体, 其它字仍由 efont 原样绘制。
+//
+// 关键: 整串都不含缺字时, drawTextOn 直接走原来的 drawString / drawCentreString /
+//       drawRightString —— 渲染结果与改动前逐像素一致, 既有排版完全不受影响;
+//       只有真含缺字的串才走逐段混排。补字字形的度量(dx/max_h/y_offset)与 efont 对齐,
+//       所以换字体不会让字距或行距跳动。
+static const lgfx::U8g2font g_supFont14(supFontData14);
+static const lgfx::U8g2font g_supFont12(supFontData12);
+
+// 取与当前字体同字号的补字字体, 并交出它的覆盖码表(升序)
+static const lgfx::IFont* supMatch(const lgfx::IFont* cur, const uint16_t** cps, int* cnt) {
+  if (cur == (const lgfx::IFont*)&lgfx::fonts::efontCN_12) {
+    *cps = SUP_CPS_12; *cnt = SUP_COUNT_12;
+    return &g_supFont12;
+  }
+  *cps = SUP_CPS_14; *cnt = SUP_COUNT_14;
+  return &g_supFont14;
+}
+
+static bool supCovered(const uint16_t* t, int n, uint16_t cp) {
+  int lo = 0, hi = n - 1;
+  while (lo <= hi) {
+    int mid = (lo + hi) >> 1;
+    if      (t[mid] == cp) return true;
+    else if (t[mid] <  cp) lo = mid + 1;
+    else                   hi = mid - 1;
+  }
+  return false;
+}
+
+// 该码点要不要交给补字字体? 要则返回交给它的码点(非 BMP 换成私用区), 不要则返回 0
+static uint32_t supPick(uint32_t cp, const uint16_t* t, int n) {
+  if (cp < 0x80) return 0;
+  uint32_t rc = cp;
+  for (int i = 0; i < SUP_NONBMP_COUNT; i++) {
+    if (SUP_NONBMP[i][0] == cp) { rc = SUP_NONBMP[i][1]; break; }
+  }
+  if (rc > 0xFFFF) return 0;
+  return supCovered(t, n, (uint16_t)rc) ? rc : 0;
+}
+
+static uint32_t utf8Next(const char*& p) {          // 解一个码点, p 前进
+  unsigned char c = (unsigned char)*p;
+  int len = 1;
+  uint32_t cp = c;
+  if      ((c & 0xE0) == 0xC0) { len = 2; cp = c & 0x1F; }
+  else if ((c & 0xF0) == 0xE0) { len = 3; cp = c & 0x0F; }
+  else if ((c & 0xF8) == 0xF0) { len = 4; cp = c & 0x07; }
+  for (int i = 1; i < len; i++) cp = (cp << 6) | ((unsigned char)p[i] & 0x3F);
+  p += len;
+  return cp;
+}
+
+static int utf8Put(char* b, uint32_t cp) {          // 编码一个码点, 返回字节数
+  if (cp < 0x800) {
+    if (cp < 0x80) { b[0] = (char)cp; return 1; }
+    b[0] = (char)(0xC0 | (cp >> 6));  b[1] = (char)(0x80 | (cp & 0x3F));
+    return 2;
+  }
+  if (cp < 0x10000) {
+    b[0] = (char)(0xE0 | (cp >> 12)); b[1] = (char)(0x80 | ((cp >> 6) & 0x3F));
+    b[2] = (char)(0x80 | (cp & 0x3F));
+    return 3;
+  }
+  b[0] = (char)(0xF0 | (cp >> 18));   b[1] = (char)(0x80 | ((cp >> 12) & 0x3F));
+  b[2] = (char)(0x80 | ((cp >> 6) & 0x3F)); b[3] = (char)(0x80 | (cp & 0x3F));
+  return 4;
+}
+
+// 逐字混排绘制。al: 0=左(x 为左边界) 1=居中(x 为中心) 2=右(x 为右边界)
+// 全串无缺字 -> 交给 M5GFX 原路径; 否则把串切成"同一字体"的连续段, 逐段 drawString。
+// 段宽用 textWidth(段的独立 C 串, 该段的字体) 量, 与 M5GFX 内部排版同一套算法。
+template <typename G>
+static void drawTextOn(G& g, const char* s, int32_t x, int32_t y, int al) {
+  if (!s || !*s) return;
+  const lgfx::IFont* main = g.getFont();
+  const uint16_t* tps;  int nt;
+  const lgfx::IFont* sup = supMatch(main, &tps, &nt);
+
+  bool need = false;                              // 先扫一遍, 有没有缺字
+  for (const char* p = s; *p; ) {
+    const char* q = p;
+    if (supPick(utf8Next(q), tps, nt)) { need = true; break; }
+    p = q;
+  }
+  if (!need) {
+    if      (al == 1) g.drawCentreString(s, x, y);
+    else if (al == 2) g.drawRightString (s, x, y);
+    else              g.drawString      (s, x, y);
+    return;
+  }
+
+  // 有缺字: 重编码进 buf(非 BMP 换成私用区码点), 并按"用哪个字体"切段
+  struct Seg { int off, len, w; const lgfx::IFont* f; };
+  static char buf[224];
+  static Seg  seg[64];
+  int nseg = 0, bl = 0;
+  for (const char* p = s; *p && bl <= (int)sizeof(buf) - 5; ) {
+    const char* q = p;
+    uint32_t cp = utf8Next(q);
+    uint32_t rc = supPick(cp, tps, nt);
+    const lgfx::IFont* f = rc ? sup : main;
+    int w = utf8Put(buf + bl, rc ? rc : cp);
+    if (nseg == 0 || seg[nseg - 1].f != f) {
+      if (nseg >= (int)(sizeof(seg) / sizeof(seg[0]))) break;
+      seg[nseg].off = bl; seg[nseg].len = w; seg[nseg].w = 0; seg[nseg].f = f;
+      ++nseg;
+    } else {
+      seg[nseg - 1].len += w;
+    }
+    bl += w;
+    p = q;
+  }
+  if (nseg == 0) return;
+  buf[bl] = 0;
+
+  int32_t total = 0;
+  for (int k = 0; k < nseg; k++) {
+    char* sp = buf + seg[k].off;
+    char  sv = sp[seg[k].len];
+    sp[seg[k].len] = 0;                           // 临时截断成独立 C 串来量宽
+    seg[k].w = g.textWidth(sp, seg[k].f);
+    sp[seg[k].len] = sv;
+    total += seg[k].w;
+  }
+
+  int32_t sx = x;
+  if      (al == 1) sx = x - total / 2;
+  else if (al == 2) sx = x - total;
+
+  // 逐段绘制。注意: 各段在 buf 里是紧挨着的, 只有整串末尾有 NUL —— 所以每段绘制前
+  // 必须临时把"本段末字节"改写成 0 截断, 画完再还原。否则 drawString 会从本段起点
+  // 一直画到整串结尾, 同一段文字被反复重画: 用 efont 画的那遍把生僻字画成方块,
+  // 用补字字体画的那遍又把常用字画成方块, 叠在一起就是"字隐约可见 + 一堆方框重叠"。
+  for (int k = 0; k < nseg; k++) {
+    char* sp = buf + seg[k].off;
+    char  sv = sp[seg[k].len];                    // 原本是下一段的首字节(末段则是整串 NUL)
+    sp[seg[k].len] = 0;
+    g.setFont(seg[k].f);
+    g.drawString(sp, sx, y);
+    sp[seg[k].len] = sv;
+    sx += seg[k].w;
+  }
+  g.setFont(main);                                // 还原, 免得影响后续绘制
+}
+
+// 画到主屏(左对齐)
+static void drawText(const char* s, int32_t x, int32_t y, int al = 0) {
+  drawTextOn(M5Cardputer.Display, s, x, y, al);
+}
+
 // ---------- 绘制 ----------
 void drawBattery() {
   int lvl = M5.Power.getBatteryLevel();
@@ -615,7 +773,7 @@ void drawList() {
   M5Cardputer.Display.setTextColor(C_TITLE);
   String hdr = "高岛易断 · 选卦";
   if (inputBuf.length()) hdr += "  >" + inputBuf;
-  M5Cardputer.Display.drawString(hdr, 2, 0);
+  drawText(hdr.c_str(), 2, 0);
   M5Cardputer.Display.setTextColor(C_TEXT);
   for (int r = 0; r < LIST_ROWS; r++) {
     int idx = listTop + r;
@@ -629,7 +787,7 @@ void drawList() {
     }
     char row[24];
     snprintf(row, sizeof(row), "%02d %s", HEXAGRAMS[idx].num, HEXAGRAMS[idx].name);
-    M5Cardputer.Display.drawString(row, 4, y);
+    drawText(row, 4, y);
   }
   // 右侧卦象区
   M5Cardputer.Display.drawLine(SPLIT_X, 20, SPLIT_X, 116, C_GRID);
@@ -681,14 +839,14 @@ void drawCast() {
   M5Cardputer.Display.setTextColor(C_TITLE);
   snprintf(buf, sizeof(buf), "%s 第%d卦",
            HEXAGRAMS[g_cast.idx].name, HEXAGRAMS[g_cast.idx].num);
-  M5Cardputer.Display.drawString(buf, 2, 70);
+  drawText(buf, 2, 70);
 
   // 动爻与之卦
   M5Cardputer.Display.setFont(&lgfx::fonts::efontCN_12);
   M5Cardputer.Display.setTextColor(C_TEXT);
   snprintf(buf, sizeof(buf), "%s爻动 -> 之卦 %s", YAO6[g_cast.dong],
            (g_cast.bianIdx >= 0) ? HEXAGRAMS[g_cast.bianIdx].name : "?");
-  M5Cardputer.Display.drawString(buf, 2, 92);
+  drawText(buf, 2, 92);
 
   M5Cardputer.Display.setTextColor(C_GRID);
   M5Cardputer.Display.drawString("断卦: 本卦+动爻+之卦", 2, 104);
@@ -720,8 +878,7 @@ static void drawTocRow(int i) {                 // 局部重绘一行(滚动时�
     g_tocSpr->setFont(&lgfx::fonts::efontCN_14);
     g_tocSpr->setTextColor(C_HL_TXT);
     g_tocSpr->setTextWrap(false);
-    g_tocSpr->setCursor(0, 0);
-    g_tocSpr->print(nm);
+    drawTextOn(*g_tocSpr, nm, 0, 0, 0);
 
     uint16_t* src = (uint16_t*)g_tocSpr->getBuffer();
     int sw = g_tocSpr->width();
@@ -731,7 +888,7 @@ static void drawTocRow(int i) {                 // 局部重绘一行(滚动时�
     M5Cardputer.Display.pushImage(TOC_NAME_X, y, TOC_NAME_W, g_tocRowH, g_slice);
   } else {
     // 其余条目: 一行放不下就截断 + 省略号, 保持静态(不再一起乱滚)
-    M5Cardputer.Display.drawString(truncName(nm, TOC_NAME_W), TOC_NAME_X, y);
+    drawText(truncName(nm, TOC_NAME_W).c_str(), TOC_NAME_X, y);
   }
 }
 
@@ -740,7 +897,7 @@ void drawToc() {
 
   // 标题行: 只显示本卦卦名, 与右上角电量框同一行(齐平)
   M5Cardputer.Display.setTextColor(C_TITLE);
-  M5Cardputer.Display.drawString(HEXAGRAMS[sel].name, 2, 0);
+  drawText(HEXAGRAMS[sel].name, 2, 0);
   M5Cardputer.Display.setFont(&lgfx::fonts::efontCN_12);
   M5Cardputer.Display.setTextColor(C_HINT);
   M5Cardputer.Display.drawRightString("Enter开 m返回", 200, 3);
@@ -764,7 +921,7 @@ void drawDetail() {
   M5Cardputer.Display.setTextColor(C_TITLE);
   char title[40];
   snprintf(title, sizeof(title), "%02d %s · %s", h.num, h.name, h.secs[secIdx].tab);
-  M5Cardputer.Display.drawString(title, 2, 0);
+  drawText(title, 2, 0);
   M5Cardputer.Display.setTextColor(C_TEXT);
   int maxTop = (int)detailLines.size() - DETAIL_ROWS;
   if (maxTop < 0) maxTop = 0;
@@ -773,7 +930,7 @@ void drawDetail() {
   for (int r = 0; r < DETAIL_ROWS; r++) {
     int li = detailTop + r;
     if (li >= (int)detailLines.size()) break;
-    M5Cardputer.Display.drawString(detailLines[li], 2, HEADER_H + r * ROW_H);
+    drawText(detailLines[li].c_str(), 2, HEADER_H + r * ROW_H);
   }
   char foot[48];
   snprintf(foot, sizeof(foot), "%d/%d 上下行 左右页 m返回",
